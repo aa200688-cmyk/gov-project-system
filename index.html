@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>政府輔導計畫名單 - 雲端試算表同步版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.19.3/package/dist/xlsx.full.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Noto Sans TC', sans-serif; }
+        .form-input { @apply w-full border border-slate-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-600 outline-none; }
+        .label-required::after { content: " *"; @apply text-red-500; }
+        .loading-overlay { background: rgba(255,255,255,0.7); position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 100; }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState } = React;
+
+        // !!! 重要：請替換成你的 Google Apps Script 部署網址 !!!
+        const GAS_URL = "https://script.google.com/macros/s/AKfycbwXrOY93N6-A9KQsbJTiYwqnoy7mx0o00q-RZNWA5weIxQ7VSzaLViXpffntwHiVSq1VQ/exec";
+
+        function App() {
+            const [assocName, setAssocName] = useState('');
+            const [isLocked, setIsLocked] = useState(false);
+            const [loading, setLoading] = useState(false);
+            const [notification, setNotification] = useState(null);
+            const [formData, setFormData] = useState({
+                companyName: '', taxId: '', address: '', pic: '', businessItems: ''
+            });
+
+            const notify = (msg, type = 'info') => {
+                setNotification({ msg, type });
+                setTimeout(() => setNotification(null), 5000);
+            };
+
+            const validate = (data) => {
+                if (!assocName.trim()) return "請先輸入公協會名稱";
+                if (!/^\d{8}$/.test(data.taxId)) return "統編需為8碼數字";
+                const addrRegex = /.+[縣市].+[區市鄉鎮].+[路街].+[號].*/;
+                if (!addrRegex.test(data.address)) return "地址格式錯誤(需含縣市、區、路街、號)";
+                if (!data.companyName || !data.pic || !data.businessItems) return "所有欄位均為必填";
+                return null;
+            };
+
+            // 核心：傳送到 Google 試算表
+            const sendToCloud = async (payload) => {
+                try {
+                    const response = await fetch(GAS_URL, {
+                        method: "POST",
+                        mode: "no-cors", // 使用 no-cors 以避開跨網域問題
+                        cache: "no-cache",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ ...payload, assocName })
+                    });
+                    
+                    // 注意：no-cors 模式下無法讀取 response 內容
+                    // 若要精確檢核重複，建議將後端 doPost 的重複檢查邏輯做得更嚴謹
+                    return true;
+                } catch (e) {
+                    console.error(e);
+                    return false;
+                }
+            };
+
+            // 精確傳送 (建議使用)
+            const sendToCloudWithResponse = async (payload) => {
+                setLoading(true);
+                try {
+                    const response = await fetch(GAS_URL, {
+                        method: "POST",
+                        body: JSON.stringify({ ...payload, assocName })
+                    });
+                    const result = await response.json();
+                    if (result.result === "success") {
+                        notify("資料已成功寫入雲端分頁！");
+                        return true;
+                    } else {
+                        alert(result.message);
+                        return false;
+                    }
+                } catch (e) {
+                    notify("系統連線失敗，請檢查網路或 GAS 部署設定", "error");
+                    return false;
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleSingleSubmit = async (e) => {
+                e.preventDefault();
+                const err = validate(formData);
+                if (err) return notify(err, "error");
+
+                const ok = await sendToCloudWithResponse(formData);
+                if (ok) setFormData({ companyName: '', taxId: '', address: '', pic: '', businessItems: '' });
+            };
+
+            const handleExcelUpload = (e) => {
+                if (!isLocked) return notify("請先鎖定公協會名稱", "error");
+                const file = e.target.files[0];
+                const reader = new FileReader();
+                reader.onload = async (evt) => {
+                    const bstr = evt.target.result;
+                    const wb = XLSX.read(bstr, { type: 'binary' });
+                    const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+                    
+                    notify(`開始批量處理 ${data.length} 筆資料...`);
+                    for (let row of data) {
+                        const item = {
+                            companyName: row["企業名稱"] || "",
+                            taxId: String(row["統一編號"] || "").padStart(8, '0'),
+                            address: row["聯絡地址"] || "",
+                            pic: row["負責人"] || "",
+                            businessItems: row["營業項目"] || ""
+                        };
+                        if (!validate(item)) {
+                            await sendToCloudWithResponse(item);
+                        }
+                    }
+                    notify("批量上傳結束");
+                };
+                reader.readAsBinaryString(file);
+            };
+
+            return (
+                <div className="container mx-auto py-12 px-4 max-w-4xl">
+                    {loading && <div className="loading-overlay"><div className="text-xl font-bold">處理中，請勿關閉視窗...</div></div>}
+                    
+                    <div className="bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200">
+                        {/* Header */}
+                        <div className="bg-blue-900 p-8 text-white text-center">
+                            <h1 className="text-2xl font-bold mb-2">年度輔導企業管理系統</h1>
+                            <p className="text-blue-200 text-sm italic">資料將即時同步至您的 Google Drive 專屬試算表</p>
+                        </div>
+
+                        <div className="p-8">
+                            {/* Association Setup */}
+                            <div className="mb-10 bg-slate-50 p-6 rounded-2xl border border-dashed border-slate-300">
+                                <label className="block text-sm font-bold text-slate-700 mb-3">1. 公協會身份設定</label>
+                                <div className="flex gap-4">
+                                    <input 
+                                        className={`form-input flex-1 font-bold ${isLocked ? 'bg-slate-200' : ''}`}
+                                        value={assocName}
+                                        onChange={e => setAssocName(e.target.value)}
+                                        disabled={isLocked}
+                                        placeholder="請輸入公協會全銜 (例如：台灣連鎖加盟促進協會)"
+                                    />
+                                    <button 
+                                        onClick={() => setIsLocked(!isLocked)}
+                                        className={`px-6 py-2 rounded-lg font-bold transition ${isLocked ? 'bg-slate-500 text-white' : 'bg-blue-600 text-white shadow-lg shadow-blue-200'}`}
+                                    >
+                                        {isLocked ? "修改" : "鎖定並建立分頁"}
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
+                                {/* Single Entry */}
+                                <div>
+                                    <h2 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                                        <span className="bg-blue-600 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">2</span>
+                                        單筆即時輸入
+                                    </h2>
+                                    <form onSubmit={handleSingleSubmit} className="space-y-4">
+                                        <div>
+                                            <div className="flex justify-between">
+                                                <label className="text-sm font-bold label-required">統一編號</label>
+                                                <a href="https://findbiz.nat.gov.tw" target="_blank" className="text-xs text-blue-600 underline">商工查詢</a>
+                                            </div>
+                                            <input required className="form-input font-mono" value={formData.taxId} onChange={e=>setFormData({...formData, taxId: e.target.value.replace(/\D/g,'')})} maxLength="8" placeholder="8碼數字" />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-bold label-required">企業名稱</label>
+                                            <input required className="form-input" value={formData.companyName} onChange={e=>setFormData({...formData, companyName: e.target.value})} placeholder="中文在前，英文在後" />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-bold label-required">聯絡地址</label>
+                                            <input required className="form-input text-xs" value={formData.address} onChange={e=>setFormData({...formData, address: e.target.value})} placeholder="需含縣市、區、路街、號、樓" />
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="text-sm font-bold label-required">負責人</label>
+                                                <input required className="form-input" value={formData.pic} onChange={e=>setFormData({...formData, pic: e.target.value})} />
+                                            </div>
+                                            <div>
+                                                <label className="text-sm font-bold label-required">營業項目</label>
+                                                <input required className="form-input" value={formData.businessItems} onChange={e=>setFormData({...formData, businessItems: e.target.value})} />
+                                            </div>
+                                        </div>
+                                        <button disabled={!isLocked || loading} className="w-full btn-primary py-4 text-lg font-bold">同步存入試算表</button>
+                                    </form>
+                                </div>
+
+                                {/* Excel Upload */}
+                                <div>
+                                    <h2 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                                        <span className="bg-blue-600 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">3</span>
+                                        批量上傳 (Excel)
+                                    </h2>
+                                    <div className="border-4 border-dashed border-slate-100 rounded-3xl p-10 text-center">
+                                        <p className="text-sm text-slate-400 mb-6">請將資料依照正確欄位排序後上傳</p>
+                                        <input 
+                                            type="file" 
+                                            accept=".xlsx, .xls" 
+                                            onChange={handleExcelUpload}
+                                            disabled={!isLocked || loading}
+                                            className="block w-full text-xs text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-bold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                                        />
+                                    </div>
+                                    <div className="mt-6 bg-amber-50 p-4 rounded-xl text-xs text-amber-700 leading-relaxed">
+                                        注意：系統會自動檢核「全試算表分頁」，若該統編已存在於任何一個分頁（包含歷史名單或其他公協會），將會被阻擋寫入。
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Notification */}
+                    {notification && (
+                        <div className={`fixed bottom-8 right-8 px-6 py-4 rounded-xl shadow-2xl text-white font-bold z-50 ${notification.type === 'error' ? 'bg-red-600' : 'bg-slate-900'}`}>
+                            {notification.msg}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
