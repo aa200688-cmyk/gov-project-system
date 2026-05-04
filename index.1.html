@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>政府輔導計畫名單 - 雲端試算表同步版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.19.3/package/dist/xlsx.full.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Noto Sans TC', sans-serif; }
+        .form-input { @apply w-full border border-slate-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-600 outline-none; }
+        .label-required::after { content: " *"; @apply text-red-500; }
+        .loading-overlay { background: rgba(255,255,255,0.8); position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; }
+        .preview-table th { @apply bg-slate-100 p-3 text-left text-sm font-bold text-slate-600 border-b; }
+        .preview-table td { @apply p-3 text-sm border-b text-slate-700; }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // !!! 重要：請替換成你的 Google Apps Script 部署網址 !!!
+        const GAS_URL = "https://script.google.com/macros/s/AKfycbwXrOY93N6-A9KQsbJTiYwqnoy7mx0o00q-RZNWA5weIxQ7VSzaLViXpffntwHiVSq1VQ/exec";
+
+        function App() {
+            const [assocName, setAssocName] = useState('');
+            const [isLocked, setIsLocked] = useState(false);
+            const [loading, setLoading] = useState(false);
+            const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
+            const [notification, setNotification] = useState(null);
+            
+            // 暫存已成功上傳的名單
+            const [uploadedList, setUploadedList] = useState([]);
+
+            const [formData, setFormData] = useState({
+                companyName: '', taxId: '', address: '', pic: '', businessItems: ''
+            });
+
+            const notify = (msg, type = 'info') => {
+                setNotification({ msg, type });
+                setTimeout(() => setNotification(null), 5000);
+            };
+
+            const validate = (data) => {
+                if (!assocName.trim()) return "請先輸入公協會名稱";
+                if (!/^\d{8}$/.test(data.taxId)) return `統編 [${data.taxId}] 需為8碼數字`;
+                const addrRegex = /.+[縣市].+[區市鄉鎮].+[路街].+[號].*/;
+                if (!addrRegex.test(data.address)) return `地址 [${data.address}] 格式錯誤(需含縣市、區、路街、號)`;
+                if (!data.companyName || !data.pic || !data.businessItems) return "所有欄位均為必填";
+                return null;
+            };
+
+            // 核心傳送函數
+            const sendToCloud = async (payload) => {
+                try {
+                    const response = await fetch(GAS_URL, {
+                        method: "POST",
+                        body: JSON.stringify({ ...payload, assocName })
+                    });
+                    const result = await response.json();
+                    return result;
+                } catch (e) {
+                    console.error("Fetch error:", e);
+                    return { result: "error", message: "連線失敗，請檢查網路或 GAS 設定" };
+                }
+            };
+
+            // 單筆提交
+            const handleSingleSubmit = async (e) => {
+                e.preventDefault();
+                const err = validate(formData);
+                if (err) return notify(err, "error");
+
+                setLoading(true);
+                const res = await sendToCloud(formData);
+                setLoading(false);
+
+                if (res.result === "success") {
+                    notify("資料已成功寫入雲端！");
+                    setUploadedList(prev => [formData, ...prev]);
+                    setFormData({ companyName: '', taxId: '', address: '', pic: '', businessItems: '' });
+                } else {
+                    alert(res.message);
+                }
+            };
+
+            // 批量上傳
+            const handleExcelUpload = (e) => {
+                if (!isLocked) return notify("請先鎖定公協會名稱", "error");
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = async (evt) => {
+                    const bstr = evt.target.result;
+                    const wb = XLSX.read(bstr, { type: 'binary' });
+                    const ws = wb.Sheets[wb.SheetNames[0]];
+                    const data = XLSX.utils.sheet_to_json(ws);
+                    
+                    if (data.length === 0) return notify("Excel 檔案內無資料", "error");
+
+                    setLoading(true);
+                    setUploadProgress({ current: 0, total: data.length });
+
+                    let successItems = [];
+                    let failCount = 0;
+
+                    // 使用序列化處理，避免併發過高導致 GAS 錯誤
+                    for (let i = 0; i < data.length; i++) {
+                        setUploadProgress(prev => ({ ...prev, current: i + 1 }));
+                        const row = data[i];
+                        
+                        const item = {
+                            companyName: (row["企業名稱"] || "").toString().trim(),
+                            taxId: (row["統一編號"] || "").toString().trim().padStart(8, '0'),
+                            address: (row["聯絡地址"] || "").toString().trim(),
+                            pic: (row["負責人"] || "").toString().trim(),
+                            businessItems: (row["營業項目"] || "").toString().trim()
+                        };
+
+                        const err = validate(item);
+                        if (err) {
+                            console.warn(`跳過第 ${i+1} 筆: ${err}`);
+                            failCount++;
+                            continue;
+                        }
+
+                        const res = await sendToCloud(item);
+                        if (res.result === "success") {
+                            successItems.push(item);
+                        } else {
+                            console.error(`第 ${i+1} 筆上傳失敗: ${res.message}`);
+                            failCount++;
+                        }
+                    }
+
+                    setUploadedList(prev => [...successItems, ...prev]);
+                    setLoading(false);
+                    notify(`處理完成！成功: ${successItems.length} 筆, 失敗: ${failCount} 筆`);
+                    e.target.value = null; // 清除 file input
+                };
+                reader.readAsBinaryString(file);
+            };
+
+            return (
+                <div className="container mx-auto py-12 px-4 max-w-5xl">
+                    {loading && (
+                        <div className="loading-overlay">
+                            <div className="bg-white p-8 rounded-2xl shadow-2xl text-center">
+                                <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent mb-4"></div>
+                                <div className="text-xl font-bold text-slate-800">雲端同步中...</div>
+                                {uploadProgress.total > 0 && (
+                                    <div className="mt-2 text-blue-600 font-mono">
+                                        進度: {uploadProgress.current} / {uploadProgress.total}
+                                    </div>
+                                )}
+                                <p className="text-sm text-slate-400 mt-2">請勿關閉或重新整理網頁</p>
+                            </div>
+                        </div>
+                    )}
+                    
+                    <div className="bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200 mb-8">
+                        {/* Header */}
+                        <div className="bg-blue-900 p-8 text-white text-center">
+                            <h1 className="text-2xl font-bold mb-2 tracking-wider">年度輔導企業管理系統</h1>
+                            <p className="text-blue-200 text-sm italic">公協會專用資料即時同步平台</p>
+                        </div>
+
+                        <div className="p-8">
+                            {/* 1. Association Name */}
+                            <div className="mb-10 bg-blue-50 p-6 rounded-2xl border border-blue-100">
+                                <label className="block text-sm font-bold text-blue-900 mb-3 uppercase tracking-widest">Step 1. 身份認證</label>
+                                <div className="flex gap-4">
+                                    <input 
+                                        className={`form-input flex-1 font-bold ${isLocked ? 'bg-slate-100 text-slate-500' : 'border-blue-300'}`}
+                                        value={assocName}
+                                        onChange={e => setAssocName(e.target.value)}
+                                        disabled={isLocked}
+                                        placeholder="請輸入公協會全銜 (例如：台灣連鎖加盟促進協會)"
+                                    />
+                                    <button 
+                                        onClick={() => {
+                                            if(!assocName.trim()) return notify("請先輸入名稱", "error");
+                                            setIsLocked(!isLocked);
+                                        }}
+                                        className={`px-8 py-2 rounded-xl font-bold transition-all ${isLocked ? 'bg-slate-500 text-white' : 'bg-blue-600 text-white shadow-lg hover:bg-blue-700'}`}
+                                    >
+                                        {isLocked ? "修改名稱" : "鎖定並開始上傳"}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* 2. Upload Methods */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
+                                {/* Single Entry */}
+                                <div className={!isLocked ? "opacity-40 pointer-events-none transition-opacity" : "transition-opacity"}>
+                                    <h2 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                                        <span className="bg-blue-600 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">2A</span>
+                                        單筆即時登錄
+                                    </h2>
+                                    <form onSubmit={handleSingleSubmit} className="space-y-4">
+                                        <div>
+                                            <div className="flex justify-between">
+                                                <label className="text-sm font-bold label-required">統一編號</label>
+                                                <a href="https://findbiz.nat.gov.tw" target="_blank" className="text-[10px] text-blue-600 underline">商工登記查詢 ↗</a>
+                                            </div>
+                                            <input required className="form-input font-mono" value={formData.taxId} onChange={e=>setFormData({...formData, taxId: e.target.value.replace(/\D/g,'')})} maxLength="8" placeholder="8碼數字" />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-bold label-required">企業名稱</label>
+                                            <input required className="form-input" value={formData.companyName} onChange={e=>setFormData({...formData, companyName: e.target.value})} placeholder="中文在前，英文在後" />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-bold label-required">聯絡地址</label>
+                                            <input required className="form-input text-xs" value={formData.address} onChange={e=>setFormData({...formData, address: e.target.value})} placeholder="需含縣市、區、路街、號" />
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="text-sm font-bold label-required">負責人</label>
+                                                <input required className="form-input" value={formData.pic} onChange={e=>setFormData({...formData, pic: e.target.value})} />
+                                            </div>
+                                            <div>
+                                                <label className="text-sm font-bold label-required">營業項目</label>
+                                                <input required className="form-input" value={formData.businessItems} onChange={e=>setFormData({...formData, businessItems: e.target.value})} />
+                                            </div>
+                                        </div>
+                                        <button disabled={!isLocked || loading} className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold shadow-lg hover:bg-blue-700 transition-all disabled:bg-slate-300">
+                                            同步存入雲端
+                                        </button>
+                                    </form>
+                                </div>
+
+                                {/* Excel Batch Upload */}
+                                <div className={!isLocked ? "opacity-40 pointer-events-none transition-opacity" : "transition-opacity"}>
+                                    <h2 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                                        <span className="bg-blue-600 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">2B</span>
+                                        批量上傳 (Excel)
+                                    </h2>
+                                    <div className="border-4 border-dashed border-slate-100 rounded-3xl p-10 text-center flex flex-col items-center justify-center min-h-[300px]">
+                                        <div className="text-4xl mb-4 text-slate-300">📊</div>
+                                        <p className="text-sm text-slate-500 mb-6 font-medium">請上傳包含標題列之 Excel 檔案<br/>(企業名稱、統一編號、聯絡地址、負責人、營業項目)</p>
+                                        <label className="cursor-pointer bg-slate-800 text-white px-8 py-3 rounded-full font-bold hover:bg-slate-700 transition-all shadow-md">
+                                            選擇檔案並開始上傳
+                                            <input 
+                                                type="file" 
+                                                accept=".xlsx, .xls" 
+                                                onChange={handleExcelUpload}
+                                                disabled={!isLocked || loading}
+                                                className="hidden"
+                                            />
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* 3. Preview List */}
+                    <div className="bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden">
+                        <div className="bg-slate-800 px-8 py-4 flex justify-between items-center text-white">
+                            <h2 className="font-bold tracking-widest flex items-center gap-2">
+                                <span className="bg-emerald-500 w-2 h-2 rounded-full animate-pulse"></span>
+                                本次成功上傳名單預覽 (暫存)
+                            </h2>
+                            <div className="text-xs bg-slate-700 px-3 py-1 rounded-full text-slate-300">
+                                總計: {uploadedList.length} 筆
+                            </div>
+                        </div>
+                        <div className="overflow-x-auto">
+                            <table className="w-full preview-table">
+                                <thead>
+                                    <tr>
+                                        <th>統一編號</th>
+                                        <th>企業名稱</th>
+                                        <th>聯絡地址</th>
+                                        <th>負責人</th>
+                                        <th>營業項目</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                    {uploadedList.length === 0 ? (
+                                        <tr>
+                                            <td colSpan="5" className="text-center py-20 text-slate-400 italic font-light">
+                                                尚未上傳任何資料，請從上方選擇單筆或批量上傳
+                                            </td>
+                                        </tr>
+                                    ) : (
+                                        uploadedList.map((item, idx) => (
+                                            <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                                                <td className="font-mono font-bold text-blue-600">{item.taxId}</td>
+                                                <td className="font-bold">{item.companyName}</td>
+                                                <td className="text-xs max-w-xs truncate">{item.address}</td>
+                                                <td>{item.pic}</td>
+                                                <td>{item.businessItems}</td>
+                                            </tr>
+                                        ))
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    {/* Notification Toast */}
+                    {notification && (
+                        <div className={`fixed bottom-8 right-8 px-8 py-4 rounded-2xl shadow-2xl text-white font-bold z-50 animate-bounce ${notification.type === 'error' ? 'bg-red-600' : 'bg-slate-900'}`}>
+                            {notification.msg}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
